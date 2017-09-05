@@ -112,6 +112,7 @@ class MarathonService(object):
         self.bindAddr = '*'
         self.groups = frozenset()
         self.mode = None
+        self.split = None
         self.balance = 'roundrobin'
         self.healthCheck = healthCheck
         self.labels = {}
@@ -131,8 +132,11 @@ class MarathonService(object):
     def __eq__(self, other):
         return self.servicePort == other.servicePort
 
+    # def __repr__(self):
+    #     return "MarathonService(%r, %r)" % (self.appId, self.servicePort)
+
     def __repr__(self):
-        return "MarathonService(%r, %r)" % (self.appId, self.servicePort)
+        return "MarathonService(%r, %r, %r)" % (self.appId, self.servicePort, self.split)
 
 
 class MarathonApp(object):
@@ -326,6 +330,394 @@ def _get_health_check_options(template, health_check, health_check_port):
         healthCheckPortOptions=' port ' + str(
             health_check_port) if health_check_port else ''
     )
+
+
+def new_config(apps, groups, bind_http_https, ssl_certs, templater,
+           haproxy_map=False, domain_map_array=[], app_map_array=[],
+           config_file="/etc/haproxy/haproxy.cfg"):
+    logger.info("in new_config")
+    logger.info("generating config")
+    config = templater.haproxy_head
+    groups = frozenset(groups)
+    duplicate_map = {}
+    # do not repeat use backend multiple times since map file is same.
+    _ssl_certs = ssl_certs or "/etc/ssl/cert.pem"
+    _ssl_certs = _ssl_certs.split(",")
+
+    if bind_http_https:
+        http_frontends = templater.haproxy_http_frontend_head
+        https_frontends = templater.haproxy_https_frontend_head.format(
+            sslCerts=" ".join(map(lambda cert: "crt " + cert, _ssl_certs))
+        )
+
+    userlists = str()
+    frontends = str()
+    backends = str()
+    http_appid_frontends = templater.haproxy_http_frontend_appid_head
+    apps_with_http_appid_backend = []
+    http_frontend_list = []
+    https_frontend_list = []
+    haproxy_dir = os.path.dirname(config_file)
+    logger.debug("HAProxy dir is %s", haproxy_dir)
+
+    for app in sorted(apps, key=attrgetter('appId', 'servicePort')):
+        # App only applies if we have it's group
+        # Check if there is a haproxy group associated with service group
+        # if not fallback to original HAPROXY group.
+        # This is added for backward compatability with HAPROXY_GROUP
+        if app.haproxy_groups:
+            if not has_group(groups, app.haproxy_groups):
+                continue
+        else:
+            if not has_group(groups, app.groups):
+                continue
+        # Skip if it's not actually enabled
+        if not app.enabled:
+            continue
+
+        logger.debug("configuring app %s", app.appId)
+        logger.debug(app)
+        if len(app.backends) < 1:
+            logger.error("skipping app %s as it is not valid to generate" +
+                         " backend without any server entries!", app.appId)
+            continue
+
+        backend = app.appId[1:].replace('/', '_') + '_' + str(app.servicePort)
+
+        logger.debug("frontend at %s:%d with backend %s",
+                     app.bindAddr, app.servicePort, backend)
+
+        # If app has HAPROXY_{n}_MODE set, use that setting.
+        # Otherwise use 'http' if HAPROXY_{N}_VHOST is set, and 'tcp' if not.
+        if app.mode is None:
+            if app.hostname:
+                app.mode = 'http'
+            else:
+                app.mode = 'tcp'
+
+        if app.authUser:
+            userlist_head = templater.haproxy_userlist_head(app)
+            userlists += userlist_head.format(
+                backend=backend,
+                user=app.authUser,
+                passwd=app.authPasswd
+            )
+
+        frontend_head = templater.haproxy_frontend_head(app)
+        frontends += frontend_head.format(
+            bindAddr=app.bindAddr,
+            backend=backend,
+            servicePort=app.servicePort,
+            mode=app.mode,
+            sslCert=' ssl crt ' + app.sslCert if app.sslCert else '',
+            bindOptions=' ' + app.bindOptions if app.bindOptions else ''
+        )
+
+        backend_head = templater.haproxy_backend_head(app)
+
+        backend_tcp = backend_head.format(
+            backend=backend+'_tcp',
+            balance=app.balance,
+            mode='tcp'
+        )
+
+        backend_http = backend_head.format(
+            backend=backend+'_http',
+            balance=app.balance,
+            mode='http'
+        )
+
+        backends += backend_head.format(
+            backend=backend,
+            balance=app.balance,
+            mode=app.mode
+        )
+
+        # if a hostname is set we add the app to the vhost section
+        # of our haproxy config
+        # TODO(lloesche): Check if the hostname is already defined by another
+        # service
+        if bind_http_https and app.hostname:
+            backend_weight, p_fe, s_fe = \
+                generateHttpVhostAcl(templater,
+                                     app,
+                                     backend,
+                                     haproxy_map,
+                                     domain_map_array,
+                                     haproxy_dir,
+                                     duplicate_map)
+            http_frontend_list.append((backend_weight, p_fe))
+            https_frontend_list.append((backend_weight, s_fe))
+
+        # if app mode is http, we add the app to the second http frontend
+        # selecting apps by http header X-Marathon-App-Id
+        if app.mode == 'http' and \
+                app.appId not in apps_with_http_appid_backend:
+            logger.debug("adding virtual host for app with id %s", app.appId)
+            # remember appids to prevent multiple entries for the same app
+            apps_with_http_appid_backend += [app.appId]
+            cleanedUpAppId = re.sub(r'[^a-zA-Z0-9\-]', '_', app.appId)
+
+            if haproxy_map:
+                if 'map_http_frontend_appid_acl' not in duplicate_map:
+                    http_appid_frontend_acl = templater \
+                        .haproxy_map_http_frontend_appid_acl(app)
+                    http_appid_frontends += http_appid_frontend_acl.format(
+                        haproxy_dir=haproxy_dir
+                    )
+                    duplicate_map['map_http_frontend_appid_acl'] = 1
+                map_element = {}
+                map_element[app.appId] = backend
+                if map_element not in app_map_array:
+                    app_map_array.append(map_element)
+            else:
+                http_appid_frontend_acl = templater \
+                    .haproxy_http_frontend_appid_acl(app)
+                http_appid_frontends += http_appid_frontend_acl.format(
+                    cleanedUpAppId=cleanedUpAppId,
+                    hostname=app.hostname,
+                    appId=app.appId,
+                    backend=backend
+                )
+
+        if app.mode == 'http':
+            if app.useHsts:
+                backends += templater.haproxy_backend_hsts_options(app)
+            backends += templater.haproxy_backend_http_options(app)
+            backend_http_backend_proxypass = templater \
+                .haproxy_http_backend_proxypass_glue(app)
+            if app.proxypath:
+                backends += backend_http_backend_proxypass.format(
+                    hostname=app.hostname,
+                    proxypath=app.proxypath
+                )
+            backend_http_backend_revproxy = templater \
+                .haproxy_http_backend_revproxy_glue(app)
+            if app.revproxypath:
+                backends += backend_http_backend_revproxy.format(
+                    hostname=app.hostname,
+                    rootpath=app.revproxypath
+                )
+            backend_http_backend_redir = templater \
+                .haproxy_http_backend_redir(app)
+            if app.redirpath:
+                backends += backend_http_backend_redir.format(
+                    hostname=app.hostname,
+                    redirpath=app.redirpath
+                )
+        
+        # Repeat the above for the http version
+        if app.useHsts:
+            backend_http += templater.haproxy_backend_hsts_options(app)
+        backend_http += templater.haproxy_backend_http_options(app)
+        backend_http_backend_proxypass = templater \
+            .haproxy_http_backend_proxypass_glue(app)
+        if app.proxypath:
+            backend_http += backend_http_backend_proxypass.format(
+                hostname=app.hostname,
+                proxypath=app.proxypath
+            )
+        backend_http_backend_revproxy = templater \
+            .haproxy_http_backend_revproxy_glue(app)
+        if app.revproxypath:
+            backend_http += backend_http_backend_revproxy.format(
+                hostname=app.hostname,
+                rootpath=app.revproxypath
+            )
+        backend_http_backend_redir = templater \
+            .haproxy_http_backend_redir(app)
+        if app.redirpath:
+            backend_http += backend_http_backend_redir.format(
+                hostname=app.hostname,
+                redirpath=app.redirpath
+            )
+
+        # Set network allowed ACLs
+        if app.mode == 'http' and app.network_allowed:
+            for network in app.network_allowed.split():
+                backends += templater.\
+                    haproxy_http_backend_network_allowed_acl(app).\
+                    format(network_allowed=network)
+            backends += templater.haproxy_http_backend_acl_allow_deny
+        elif app.mode == 'tcp' and app.network_allowed:
+            for network in app.network_allowed.split():
+                backends += templater.\
+                    haproxy_tcp_backend_network_allowed_acl(app).\
+                    format(network_allowed=network)
+            backends += templater.haproxy_tcp_backend_acl_allow_deny
+
+        # Repeat for both http and tcp version
+        if app.network_allowed:
+            for network in app.network_allowed.split():
+                backend_http += templater.\
+                    haproxy_http_backend_network_allowed_acl(app).\
+                    format(network_allowed=network)
+
+                backend_tcp += templater.\
+                    haproxy_tcp_backend_network_allowed_acl(app).\
+                    format(network_allowed=network)
+
+            backend_http += templater.haproxy_http_backend_acl_allow_deny
+
+            backend_tcp += templater.haproxy_tcp_backend_acl_allow_deny
+
+        if app.sticky:
+            logger.debug("turning on sticky sessions")
+            backends += templater.haproxy_backend_sticky_options(app)
+            backend_http += templater.haproxy_backend_sticky_options(app)
+            backend_tcp += templater.haproxy_backend_sticky_options(app)
+
+        frontend_backend_glue = templater.haproxy_frontend_backend_glue(app)
+        frontends += frontend_backend_glue.format(backend=backend)
+
+        do_backend_healthcheck_options_once = True
+        key_func = attrgetter('host', 'port')
+        for backend_service_idx, backendServer\
+                in enumerate(sorted(app.backends, key=key_func)):
+            if do_backend_healthcheck_options_once:
+                if app.healthCheck:
+                    template_backend_health_check = None
+                    if app.mode == 'tcp' \
+                            or app.healthCheck['protocol'] == 'TCP':
+                        template_backend_health_check = templater \
+                            .haproxy_backend_tcp_healthcheck_options(app)
+                    elif app.mode == 'http':
+                        template_backend_health_check = templater \
+                            .haproxy_backend_http_healthcheck_options(app)
+                    if template_backend_health_check:
+                        health_check_port = get_backend_port(
+                            apps,
+                            app,
+                            backend_service_idx)
+                        backends += _get_health_check_options(
+                            template_backend_health_check,
+                            app.healthCheck,
+                            health_check_port)
+                # Todo (Justin Lee): Add repeats for http and tcp backends
+                do_backend_healthcheck_options_once = False
+
+            logger.debug(
+                "backend server %s:%d on %s",
+                backendServer.ip,
+                backendServer.port,
+                backendServer.host)
+
+            # Create a unique, friendly name for the backend server.  We concat
+            # the host, task IP and task port together.  If the host and task
+            # IP are actually the same then omit one for clarity.
+            if backendServer.host != backendServer.ip:
+                serverName = re.sub(
+                    r'[^a-zA-Z0-9\-]', '_',
+                    (backendServer.host + '_' +
+                     backendServer.ip + '_' +
+                     str(backendServer.port)))
+            else:
+                serverName = re.sub(
+                    r'[^a-zA-Z0-9\-]', '_',
+                    (backendServer.ip + '_' +
+                     str(backendServer.port)))
+            shortHashedServerName = hashlib.sha1(serverName.encode()) \
+                .hexdigest()[:10]
+
+            server_health_check_options = None
+            if app.healthCheck:
+                template_server_healthcheck_options = None
+                if app.mode == 'tcp' or app.healthCheck['protocol'] == 'TCP':
+                    template_server_healthcheck_options = templater \
+                        .haproxy_backend_server_tcp_healthcheck_options(app)
+                elif app.mode == 'http':
+                    template_server_healthcheck_options = templater \
+                        .haproxy_backend_server_http_healthcheck_options(app)
+                if template_server_healthcheck_options:
+                    if app.healthcheck_port_index is not None:
+                        health_check_port = \
+                            get_backend_port(apps, app, backend_service_idx)
+                    else:
+                        health_check_port = app.healthCheck.get('port')
+                    server_health_check_options = _get_health_check_options(
+                        template_server_healthcheck_options,
+                        app.healthCheck,
+                        health_check_port)
+            backend_server_options = templater \
+                .haproxy_backend_server_options(app)
+
+            backends += backend_server_options.format(
+                host=backendServer.host,
+                host_ipv4=backendServer.ip,
+                port=backendServer.port,
+                serverName=serverName,
+                cookieOptions=' check cookie ' +
+                shortHashedServerName if app.sticky else '',
+                healthCheckOptions=server_health_check_options
+                if server_health_check_options else '',
+                otherOptions=' disabled' if backendServer.draining else ''
+            )
+
+            # Todo (Justin Lee): Fix healthCheckOptions
+            backend_http += backend_server_options.format(
+                host=backendServer.host,
+                host_ipv4=backendServer.ip,
+                port=backendServer.port,
+                serverName=serverName,
+                cookieOptions=' check cookie ' +
+                shortHashedServerName if app.sticky else '',
+                healthCheckOptions='',
+                otherOptions=' disabled' if backendServer.draining else ''
+            )
+
+            # Todo (Justin Lee): Fix healthCheckOptions
+            backend_tcp += "  server {serverName} {host_ipv4}:{port}\n".format(
+                host_ipv4=backendServer.ip,
+                port=backendServer.port,
+                serverName=serverName
+            )
+
+        logger.debug("New backends:")
+        logger.debug(backend_http)
+        logger.debug(backend_tcp)
+
+        backends += backend_http
+        backends += backend_tcp
+
+    http_frontend_list.sort(key=lambda x: x[0], reverse=True)
+    https_frontend_list.sort(key=lambda x: x[0], reverse=True)
+
+    logger.debug("Going through http_frontend_list")
+    for backend in http_frontend_list:
+        logger.debug(backend)
+        http_frontends += backend[1]
+    logger.debug("Going through https_frontend_list")
+    for backend in https_frontend_list:
+        logger.debug(backend)
+        https_frontends += backend[1]
+
+    logger.debug("\nuserlists:")
+    logger.debug(userlists)
+    config += userlists
+
+    if bind_http_https:
+        logger.debug("\nhttp_frontends:")
+        logger.debug(http_frontends)
+        config += http_frontends
+    
+    logger.debug("\nhttp_appid_frontends:")
+    logger.debug(http_appid_frontends)
+    config += http_appid_frontends
+    
+    if bind_http_https:
+        logger.debug("\nhttps_frontends:")
+        logger.debug(https_frontends)
+        config += https_frontends
+    
+    logger.debug("\nfrontends:")
+    logger.debug(frontends)
+    config += frontends
+    
+    logger.debug("\nbackends:")
+    logger.debug(backends)
+    config += backends
+
+    return config
 
 
 def config(apps, groups, bind_http_https, ssl_certs, templater,
@@ -607,7 +999,6 @@ def config(apps, groups, bind_http_https, ssl_certs, templater,
     config += backends
 
     return config
-
 
 def get_haproxy_pids():
     try:
@@ -1226,6 +1617,7 @@ healthCheckResultCache = LRUCache()
 def get_apps(marathon):
     apps = marathon.list()
     logger.debug("got apps %s", [app["id"] for app in apps])
+    logger.debug(apps)
 
     marathon_apps = []
     # This process requires 2 passes: the first is to gather apps belonging
@@ -1447,6 +1839,15 @@ def regenerate_config(apps, config_file, groups, bind_http_https,
     generated_config = config(apps, groups, bind_http_https, ssl_certs,
                               templater, haproxy_map, domain_map_array,
                               app_map_array, config_file)
+
+    dummy_config = new_config(apps, groups, bind_http_https, ssl_certs,
+                              templater, haproxy_map, domain_map_array,
+                              app_map_array, config_file)
+
+    logger.debug("\ndummy config:")
+    logger.debug(dummy_config)
+
+    generated_config = dummy_config
 
     compareWriteAndReloadConfig(generated_config, config_file,
                                 domain_map_array, app_map_array, haproxy_map)
