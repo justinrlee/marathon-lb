@@ -118,6 +118,7 @@ class MarathonService(object):
         self.backend_weight = 0
         self.network_allowed = None
         self.healthcheck_port_index = None
+        self.custom_termination = None
         if healthCheck:
             if healthCheck['protocol'] == 'HTTP':
                 self.mode = 'http'
@@ -371,6 +372,8 @@ def config(apps, groups, bind_http_https, ssl_certs, templater,
             continue
 
         logger.debug("configuring app %s", app.appId)
+        # TODO: Remove debug statement for custom termination mode.
+        logger.debug("custom termination mode: %s", app.custom_termination)
         if len(app.backends) < 1:
             logger.error("skipping app %s as it is not valid to generate" +
                          " backend without any server entries!", app.appId)

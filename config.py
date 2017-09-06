@@ -1201,6 +1201,10 @@ def set_redirpath(x, k, v):
 def set_network_allowed(x, k, v):
     x.network_allowed = v
 
+def set_custom_termination(x, k, v):
+    if v.lower() in ['front','back','both']:
+        x.custom_termination = v.lower()
+
 
 class Label:
     def __init__(self, name, func, description, perServicePort=True):
@@ -1588,6 +1592,18 @@ labels.append(Label(name='HTTP_BACKEND_NETWORK_ALLOWED_ACL',
 labels.append(Label(name='TCP_BACKEND_NETWORK_ALLOWED_ACL',
                     func=set_label,
                     description=''))
+labels.append(Label(name='CUSTOM_TERMINATION',
+                    func=set_custom_termination,
+                    description='''\
+Set up a custom termination backend and domain mapping.  Supports three (3) case-insensitive options:
+    FRONT
+    BACK
+    BOTH
+
+"FRONT" sets up a backend with a `_http` postfix, and adds the app vhosts to domain2customfront.map
+"BACK" sets up a backend with a `_tcp` postfix, and adds the app vhosts to domain2customback.map
+"BOTH" does both.
+                    '''))
 
 labels.sort(key=lambda l: l.name)
 
