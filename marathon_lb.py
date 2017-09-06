@@ -416,6 +416,17 @@ def config(apps, groups, bind_http_https, ssl_certs, templater,
             balance=app.balance,
             mode=app.mode
         )
+        backend_tcp = backend_head.format(
+            backend=backend+'_tcp',
+            balance=app.balance,
+            mode='tcp'
+        )
+
+        backend_http = backend_head.format(
+            backend=backend+'_http',
+            balance=app.balance,
+            mode='http'
+        )
 
         # if a hostname is set we add the app to the vhost section
         # of our haproxy config
@@ -490,6 +501,32 @@ def config(apps, groups, bind_http_https, ssl_certs, templater,
                     redirpath=app.redirpath
                 )
 
+        # Repeat the above for the http version (should occur regradless of mode)
+        if app.useHsts:
+            backend_http += templater.haproxy_backend_hsts_options(app)
+        backend_http += templater.haproxy_backend_http_options(app)
+        backend_http_backend_proxypass = templater \
+            .haproxy_http_backend_proxypass_glue(app)
+        if app.proxypath:
+            backend_http += backend_http_backend_proxypass.format(
+                hostname=app.hostname,
+                proxypath=app.proxypath
+            )
+        backend_http_backend_revproxy = templater \
+            .haproxy_http_backend_revproxy_glue(app)
+        if app.revproxypath:
+            backend_http += backend_http_backend_revproxy.format(
+                hostname=app.hostname,
+                rootpath=app.revproxypath
+            )
+        backend_http_backend_redir = templater \
+            .haproxy_http_backend_redir(app)
+        if app.redirpath:
+            backend_http += backend_http_backend_redir.format(
+                hostname=app.hostname,
+                redirpath=app.redirpath
+            )
+
         # Set network allowed ACLs
         if app.mode == 'http' and app.network_allowed:
             for network in app.network_allowed.split():
@@ -504,9 +541,26 @@ def config(apps, groups, bind_http_https, ssl_certs, templater,
                     format(network_allowed=network)
             backends += templater.haproxy_tcp_backend_acl_allow_deny
 
+        # Repeat for both http and tcp version (should occur regardless of mode)
+        if app.network_allowed:
+            for network in app.network_allowed.split():
+                backend_http += templater.\
+                    haproxy_http_backend_network_allowed_acl(app).\
+                    format(network_allowed=network)
+
+                backend_tcp += templater.\
+                    haproxy_tcp_backend_network_allowed_acl(app).\
+                    format(network_allowed=network)
+
+            backend_http += templater.haproxy_http_backend_acl_allow_deny
+
+            backend_tcp += templater.haproxy_tcp_backend_acl_allow_deny
+
         if app.sticky:
             logger.debug("turning on sticky sessions")
             backends += templater.haproxy_backend_sticky_options(app)
+            backend_http += templater.haproxy_backend_sticky_options(app)
+            backend_tcp += templater.haproxy_backend_sticky_options(app)
 
         frontend_backend_glue = templater.haproxy_frontend_backend_glue(app)
         frontends += frontend_backend_glue.format(backend=backend)
@@ -534,6 +588,17 @@ def config(apps, groups, bind_http_https, ssl_certs, templater,
                             template_backend_health_check,
                             app.healthCheck,
                             health_check_port)
+
+                        backend_http += _get_health_check_options(
+                            templater.haproxy_backend_http_healthcheck_options(app),
+                            app.healthCheck,
+                            health_check_port)
+
+                        backend_tcp += _get_health_check_options(
+                            templater.haproxy_backend_tcp_healthcheck_options(app),
+                            app.healthCheck,
+                            health_check_port)
+
                 do_backend_healthcheck_options_once = False
 
             logger.debug(
@@ -591,6 +656,32 @@ def config(apps, groups, bind_http_https, ssl_certs, templater,
                 if server_health_check_options else '',
                 otherOptions=' disabled' if backendServer.draining else ''
             )
+
+            backend_http += backend_server_options.format(
+                host=backendServer.host,
+                host_ipv4=backendServer.ip,
+                port=backendServer.port,
+                serverName=serverName,
+                cookieOptions=' check cookie ' +
+                shortHashedServerName if app.sticky else '',
+                healthCheckOptions='',
+                otherOptions=' disabled' if backendServer.draining else ' ssl verify none'
+            )
+            """ Note the automatic add of 'ssl verify none' - this is because currently the 
+            only use of this backend is for container-terminated backends, in which case
+            we want to connect with HTTPS and not HTTP."""
+
+            backend_tcp += "  server {serverName} {host_ipv4}:{port}\n".format(
+                host_ipv4=backendServer.ip,
+                port=backendServer.port,
+                serverName=serverName
+            )
+
+        if app.custom_termination in ["front", "both"]:
+            backends += backend_http
+
+        if app.custom_termination in ["back", "both"]:
+            backends += backend_tcp
 
     http_frontend_list.sort(key=lambda x: x[0], reverse=True)
     https_frontend_list.sort(key=lambda x: x[0], reverse=True)
@@ -1450,6 +1541,9 @@ def regenerate_config(apps, config_file, groups, bind_http_https,
     generated_config = config(apps, groups, bind_http_https, ssl_certs,
                               templater, haproxy_map, domain_map_array,
                               app_map_array, config_file)
+
+    logger.debug("\nNew config:")
+    logger.debug(generated_config)
 
     compareWriteAndReloadConfig(generated_config, config_file,
                                 domain_map_array, app_map_array, haproxy_map)
