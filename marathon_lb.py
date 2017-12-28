@@ -611,7 +611,7 @@ def config(apps, groups, bind_http_https, ssl_certs, templater,
     # that includes the 'daemon' flag:
     if 'daemon' in config:
         logger.debug("Commenting out daemon setting")
-        config = config.replace("daemon", "# daemon")
+        config = config.replace("daemon", "# daemon", 1)
 
     # This should handle situations where customers have a custom HAPROXY_HEAD
     # that does not yet expose the listeners file descriptor
